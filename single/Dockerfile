@@ -9,7 +9,7 @@
 
 # ---------- builder: compile ocserv 1.5.0 + sso patch ----------
 FROM debian:12-slim AS builder
-ARG APT_MIRROR=mirrors.tencentyun.com
+ARG APT_MIRROR=
 RUN if [ -n "$APT_MIRROR" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config meson ninja-build \
@@ -28,8 +28,8 @@ RUN wget -q https://www.infradead.org/ocserv/download/ocserv-1.5.0.tar.xz \
 
 # ---------- runtime: ocserv + portal + helper ----------
 FROM debian:12-slim
-ARG APT_MIRROR=mirrors.tencentyun.com
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG APT_MIRROR=
+ARG PIP_INDEX_URL=
 RUN if [ -n "$APT_MIRROR" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi
 
 # Runtime deps:
