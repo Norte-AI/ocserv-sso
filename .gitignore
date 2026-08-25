@@ -1,0 +1,13 @@
+# build / runtime artifacts
+*.pyc
+__pycache__/
+.venv/
+.env
+
+# local config (copied from examples/, not committed)
+ocserv.conf
+docker-compose.yml
+
+# test scratch
+.cache/
+sso-int-*/

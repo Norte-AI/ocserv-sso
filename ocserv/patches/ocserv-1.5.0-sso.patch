@@ -1,0 +1,747 @@
+diff --git a/src/worker-auth.c b/src/worker-auth.c
+index 2be1525..015c7b7 100644
+--- a/src/worker-auth.c
++++ b/src/worker-auth.c
+@@ -33,6 +33,8 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <limits.h>
++#include <time.h>
++#include <ctype.h>
+ #include <ipc.pb-c.h>
+ #include <base64-helper.h>
+ 
+@@ -109,6 +111,289 @@ static const char ocv3_success_msg_foot[] = "</auth>\n";
+ #define HTTP_AUTH_OIDC_PREFIX "Bearer"
+ #endif
+ 
++/* --- SSO (AnyConnect sso-v2 / single-sign-on-v2) support ----------------
++ * Configured via environment (worker inherits from main):
++ *   OCSERV_SSO_ENABLE=1|true      - master switch
++ *   OCSERV_SSO_BASE_URL           - public base URL, e.g. https://vpn.example.com
++ *   OCSERV_SSO_PROXY              - portal upstream, host:port (default 127.0.0.1:8443)
++ *
++ * Flow: when a client advertises the single-sign-on-v2 capability we reply
++ * with an sso-v2 form pointing at {BASE}/+CSCOE+/sso/start?sid=... (served
++ * by the portal through the /+CSCOE+/sso/ proxy route). The client opens
++ * its embedded browser; on completion the portal sets the acSamlv2Token
++ * cookie. The client then POSTs <sso-token>TOKEN</sso-token>, where
++ * TOKEN = user || sid || ticket with:
++ *   user   = base32(github login), chars [a-z2-7], variable length
++ *   sid    = 26 hex chars, generated per login form
++ *   ticket = 32 chars [0-9a-z], issued by the portal
++ * We split TOKEN into username/password (password = "sid.ticket") and feed
++ * both into the regular username/password auth path; the PAM backend
++ * (pam_exec helper) POSTs the password to the portal's /introspect.
++ */
++#define SSO_SID_LEN 26
++#define SSO_TICKET_LEN 32
++#define SSO_TOKEN_MIN (SSO_SID_LEN + SSO_TICKET_LEN + 1)
++
++struct sso_cfg_st {
++	unsigned int loaded;
++	unsigned int enabled;
++	char base_url[192];
++	char proxy_host[64];
++	unsigned int proxy_port;
++};
++
++static struct sso_cfg_st sso_cfg;
++
++static void sso_cfg_load(void)
++{
++	const char *env;
++
++	sso_cfg.loaded = 1;
++	sso_cfg.enabled = 0;
++
++	env = getenv("OCSERV_SSO_ENABLE");
++	if (env == NULL ||
++	    (strcmp(env, "1") != 0 && strcasecmp(env, "true") != 0))
++		return;
++
++	env = getenv("OCSERV_SSO_BASE_URL");
++	if (env == NULL || env[0] == 0 ||
++	    strlen(env) >= sizeof(sso_cfg.base_url))
++		return;
++	strlcpy(sso_cfg.base_url, env, sizeof(sso_cfg.base_url));
++
++	strlcpy(sso_cfg.proxy_host, "127.0.0.1", sizeof(sso_cfg.proxy_host));
++	sso_cfg.proxy_port = 8443;
++	env = getenv("OCSERV_SSO_PROXY");
++	if (env != NULL && env[0] != 0) {
++		char host[64];
++		unsigned int port;
++
++		if (sscanf(env, "%63[^:]:%u", host, &port) == 2 &&
++		    port > 0 && port < 65536) {
++			strlcpy(sso_cfg.proxy_host, host,
++				sizeof(sso_cfg.proxy_host));
++			sso_cfg.proxy_port = port;
++		}
++	}
++
++	sso_cfg.enabled = 1;
++}
++
++unsigned int sso_is_enabled(void)
++{
++	if (!sso_cfg.loaded)
++		sso_cfg_load();
++	return sso_cfg.enabled;
++}
++
++void sso_proxy_target(char *host, size_t host_size, unsigned int *port)
++{
++	if (!sso_cfg.loaded)
++		sso_cfg_load();
++	strlcpy(host, sso_cfg.proxy_host, host_size);
++	*port = sso_cfg.proxy_port;
++}
++
++static int sso_gen_sid(char *sid, size_t sid_size)
++{
++	uint8_t rnd[SSO_SID_LEN / 2];
++	unsigned int i;
++
++	if (sid_size < SSO_SID_LEN + 1)
++		return -1;
++	if (gnutls_rnd(GNUTLS_RND_NONCE, rnd, sizeof(rnd)) < 0)
++		return -1;
++	for (i = 0; i < sizeof(rnd); i++)
++		snprintf(&sid[i * 2], 3, "%02x", rnd[i]);
++	return 0;
++}
++
++/* TOKEN = user || sid || ticket, all alphanumeric; password = "sid.ticket" */
++static int sso_split_token(const char *tok, unsigned int toklen,
++			   char *user, size_t user_size, char *pass,
++			   size_t pass_size)
++{
++	unsigned int i, ulen;
++
++	if (toklen < SSO_TOKEN_MIN || toklen > SSO_TOKEN_MIN + 64)
++		return -1;
++
++	for (i = 0; i < toklen; i++) {
++		if (isalnum((unsigned char)tok[i]) == 0)
++			return -1;
++	}
++
++	ulen = toklen - SSO_SID_LEN - SSO_TICKET_LEN;
++	if (ulen + 1 > user_size)
++		return -1;
++	if (pass_size < SSO_SID_LEN + SSO_TICKET_LEN + 2)
++		return -1;
++
++	memcpy(user, tok, ulen);
++	user[ulen] = 0;
++
++	memcpy(pass, &tok[ulen], SSO_SID_LEN);
++	pass[SSO_SID_LEN] = '.';
++	memcpy(&pass[SSO_SID_LEN + 1], &tok[ulen + SSO_SID_LEN],
++	       SSO_TICKET_LEN);
++	pass[SSO_SID_LEN + 1 + SSO_TICKET_LEN] = 0;
++	return 0;
++}
++
++static unsigned int sso_client_capable(struct http_req_st *req)
++{
++	if (req->body == NULL || req->body_length == 0)
++		return 0;
++	if (memmem(req->body, req->body_length, "single-sign-on-v2",
++		   sizeof("single-sign-on-v2") - 1) != NULL)
++		return 1;
++	return 0;
++}
++
++/* returns the sso-token value from the reply body (talloc'd from the body),
++ * or NULL if absent */
++static char *sso_token_in_reply(worker_st *ws, struct http_req_st *req)
++{
++	char *tok = NULL;
++
++	if (req->body == NULL || req->body_length == 0)
++		return NULL;
++	if (parse_reply(ws, req->body, req->body_length, "sso-token",
++			sizeof("sso-token") - 1, "sso-token",
++			sizeof("sso-token") - 1, &tok) < 0)
++		return NULL;
++	if (tok == NULL || tok[0] == 0)
++		return NULL;
++	return tok;
++}
++
++static int sso_append_login_form(worker_st *ws, str_st *str)
++{
++	int ret;
++	char sid[SSO_SID_LEN + 1];
++	unsigned long long chash;
++	const char *dh = NULL;
++	char dhurl[256];
++	char external_mode = 0;
++	char sso_base[300];
++	const char *base;
++
++	if (sso_gen_sid(sid, sizeof(sid)) < 0)
++		return -1;
++	strlcpy(ws->sso_sid, sid, sizeof(ws->sso_sid));
++
++	/* Build the sso URLs on the host the client actually connected to
++	 * (Host header) — clients refuse to open the browser for a login
++	 * URL on a different host than the VPN server they dialed. */
++	if (ws->req.raw_hostname[0] != 0) {
++		snprintf(sso_base, sizeof(sso_base), "https://%s",
++			 ws->req.raw_hostname);
++		base = sso_base;
++	} else {
++		base = sso_cfg.base_url;
++	}
++
++	if (ws->req.strap_dh_pubkey_set && ws->req.is_mobile == 0) {
++		/* external-browser (STRAP) mode for desktop clients: pass the
++		 * client's DH pubkey to the portal in the login URL (base64url)
++		 * so it can ECIES-encrypt the sso token back via
++		 * localhost:29786. Mobile clients use the embedded in-app
++		 * browser (their system browser shares the sandbox and the
++		 * localhost listener is unreachable from it). */
++		unsigned int i, o = 0;
++
++		for (i = 0; ws->req.strap_dh_pubkey[i] != 0 && o < sizeof(dhurl) - 1; i++) {
++			char c = ws->req.strap_dh_pubkey[i];
++			if (c == '+')
++				c = '-';
++			else if (c == '/')
++				c = '_';
++			else if (c == '=')
++				break;
++			dhurl[o++] = c;
++		}
++		dhurl[o] = 0;
++		if (o > 0) {
++			dh = dhurl;
++			external_mode = 1;
++		}
++	}
++
++	/* config-hash mimics ASA (monotonic value); clients echo it back */
++	chash = (unsigned long long)time(NULL);
++
++	/* Structure mirrors a real ASA capture (openconnect MR !75):
++	 * aggregate-auth-version="2" attribute and <opaque> as a direct
++	 * child of <config-auth>, BEFORE <auth>. */
++	ret = str_append_str(str,
++			     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++			     "<config-auth client=\"vpn\" type=\"auth-request\" "
++			     "aggregate-auth-version=\"2\">\n"
++			     VERSION_MSG
++			     "<opaque is-for=\"sg\">"
++			     "<tunnel-group>standard-group</tunnel-group>"
++			     "<auth-method>single-sign-on-v2</auth-method>");
++	if (ret < 0)
++		return -1;
++
++	ret = str_append_printf(str, "<config-hash>%llu</config-hash></opaque>\n",
++				chash);
++	if (ret < 0)
++		return -1;
++
++	ret = str_append_str(str,
++			     "<auth id=\"main\">\n"
++			     "<title>Login</title>\n"
++			     "<message>Please complete the authentication "
++			     "process in the AnyConnect Login window."
++			     "</message>\n"
++			     "<banner></banner>\n");
++	if (ret < 0)
++		return -1;
++
++	ret = str_append_printf(
++		str,
++		"<sso-v2-login>%s/+CSCOE+/sso/start?sid=%s%s%s</sso-v2-login>\n"
++		"<sso-v2-login-final>%s/+CSCOE+/sso/done</sso-v2-login-final>\n"
++		"<sso-v2-logout>%s/+CSCOE+/sso/logout</sso-v2-logout>\n"
++		"<sso-v2-logout-final>%s/+CSCOE+/sso/done"
++		"</sso-v2-logout-final>\n",
++		base, sid, dh ? "&amp;dh=" : "", dh ? dh : "",
++		base, base, base);
++	if (ret < 0)
++		return -1;
++
++	ret = str_append_str(str,
++			     "<sso-v2-token-cookie-name>acSamlv2Token"
++			     "</sso-v2-token-cookie-name>\n"
++			     "<sso-v2-error-cookie-name>acSamlv2Error"
++			     "</sso-v2-error-cookie-name>\n");
++	if (ret < 0)
++		return -1;
++
++	if (external_mode) {
++		ret = str_append_str(str,
++				     "<sso-v2-browser-mode>external"
++				     "</sso-v2-browser-mode>\n");
++		if (ret < 0)
++			return -1;
++	}
++
++	ret = str_append_str(str,
++			     "<form method=\"post\" action=\"/auth\">\n"
++			     "<input type=\"sso\" name=\"sso-token\">"
++			     "</input>\n");
++	if (ret < 0)
++		return -1;
++
++	ret = str_append_str(str, OC_LOGIN_END);
++	if (ret < 0)
++		return -1;
++
++	return 0;
++}
++
+ static int basic_auth_handler(worker_st *ws, unsigned int http_ver,
+ 			      const char *msg);
+ 
+@@ -349,6 +634,18 @@ int get_auth_handler2(worker_st *ws, unsigned int http_ver, const char *pmsg,
+ 
+ 	} else {
+ 		/* Username / Groups Form */
++		if (sso_is_enabled() && ws->sso_capable && ws->sso_attempted == 0 &&
++		    ws->req.user_agent_type != AGENT_OPENCONNECT_V3) {
++			oclog(ws, LOG_DEBUG, "sso: sending sso-v2 login form");
++			ret = sso_append_login_form(ws, &str);
++			if (ret < 0) {
++				ret = -1;
++				goto cleanup;
++			}
++			ws->sso_attempted = 1;
++			goto body_send;
++		}
++
+ 		if (pmsg == NULL)
+ 			pmsg = "Please enter your username and password.";
+ 
+@@ -505,6 +802,7 @@ int get_auth_handler2(worker_st *ws, unsigned int http_ver, const char *pmsg,
+ 		}
+ 	}
+ 
++body_send:
+ 	ret = cstp_printf(ws, "Content-Length: %u\r\n",
+ 			  (unsigned int)str.length);
+ 	if (ret < 0) {
+@@ -1592,6 +1890,9 @@ int post_auth_handler(worker_st *ws, unsigned int http_ver)
+ 
+ 		ws->groupname_url_forced = 0;
+ 
++		if (sso_is_enabled() && sso_client_capable(req))
++			ws->sso_capable = 1;
++
+ 		/* If the URL is not a known one and more than a character, we parse it as a group indicator */
+ 		if (WSRCONFIG(ws)->select_group_by_url != 0 &&
+ 		    http_post_known_service_check(ws, req->url) == NULL &&
+@@ -1689,20 +1990,58 @@ int post_auth_handler(worker_st *ws, unsigned int http_ver)
+ 		}
+ 
+ 		if (ws->selected_auth->type & AUTH_TYPE_USERNAME_PASS) {
+-			ret = parse_reply(ws, req->body, req->body_length,
+-					  USERNAME_FIELD,
+-					  sizeof(USERNAME_FIELD) - 1, NULL, 0,
+-					  &username);
+-			if (ret < 0) {
+-				oclog(ws, LOG_HTTP_DEBUG,
+-				      "failed reading username");
+-				goto ask_auth;
+-			}
++			char *sso_tok = NULL;
++
++			if (sso_is_enabled() && ws->sso_capable &&
++			    ws->sso_attempted == 1)
++				sso_tok = sso_token_in_reply(ws, req);
++
++			if (sso_tok != NULL) {
++				char sso_user[MAX_USERNAME_SIZE];
++				char sso_pass[SSO_SID_LEN + SSO_TICKET_LEN + 2];
++
++				if (sso_split_token(sso_tok, strlen(sso_tok),
++						    sso_user, sizeof(sso_user),
++						    sso_pass,
++						    sizeof(sso_pass)) < 0) {
++					oclog(ws, LOG_INFO,
++					      "sso: malformed sso-token in reply");
++					goto ask_auth;
++				}
+ 
+-			strlcpy(ws->username, username, sizeof(ws->username));
+-			talloc_free(username);
+-			ireq.user_name = ws->username;
+-			ireq.auth_type |= AUTH_TYPE_USERNAME_PASS;
++				strlcpy(ws->username, sso_user,
++					sizeof(ws->username));
++				/* keep username non-NULL so this reply is
++				 * re-processed to submit the password */
++				username = talloc_strdup(ws->req.body,
++							 sso_user);
++				if (username == NULL) {
++					reason = MSG_INTERNAL_ERROR;
++					goto auth_fail;
++				}
++				ireq.user_name = ws->username;
++				ireq.auth_type |= AUTH_TYPE_USERNAME_PASS;
++				oclog(ws, LOG_INFO,
++				      "sso: received sso-token for user '%s'",
++				      ws->username);
++			} else {
++				ret = parse_reply(ws, req->body,
++						  req->body_length,
++						  USERNAME_FIELD,
++						  sizeof(USERNAME_FIELD) - 1,
++						  NULL, 0, &username);
++				if (ret < 0) {
++					oclog(ws, LOG_HTTP_DEBUG,
++					      "failed reading username");
++					goto ask_auth;
++				}
++
++				strlcpy(ws->username, username,
++					sizeof(ws->username));
++				talloc_free(username);
++				ireq.user_name = ws->username;
++				ireq.auth_type |= AUTH_TYPE_USERNAME_PASS;
++			}
+ 		}
+ 
+ 		if (ws->selected_auth->type & AUTH_TYPE_CERTIFICATE) {
+@@ -1812,12 +2151,40 @@ int post_auth_handler(worker_st *ws, unsigned int http_ver)
+ 
+ 		if (areq.password == NULL &&
+ 		    (ws->selected_auth->type & AUTH_TYPE_USERNAME_PASS)) {
+-			ret = match_password_in_reply(
+-				ws, req->body, req->body_length, &password);
+-			if (ret < 0) {
+-				reason = MSG_NO_PASSWORD_ERROR;
+-				oclog(ws, LOG_ERR, "failed reading password");
+-				goto auth_fail;
++			char *sso_tok = NULL;
++
++			if (sso_is_enabled() && ws->sso_capable)
++				sso_tok = sso_token_in_reply(ws, req);
++
++			if (sso_tok != NULL) {
++				char sso_pass[SSO_SID_LEN + SSO_TICKET_LEN + 2];
++				char tuser[MAX_USERNAME_SIZE];
++
++				if (sso_split_token(sso_tok, strlen(sso_tok),
++						    tuser, sizeof(tuser),
++						    sso_pass,
++						    sizeof(sso_pass)) < 0) {
++					reason = MSG_NO_PASSWORD_ERROR;
++					oclog(ws, LOG_ERR,
++					      "sso: malformed sso-token in reply");
++					goto auth_fail;
++				}
++				password = talloc_strdup(ws->req.body,
++							 sso_pass);
++				if (password == NULL) {
++					reason = MSG_INTERNAL_ERROR;
++					goto auth_fail;
++				}
++			} else {
++				ret = match_password_in_reply(
++					ws, req->body, req->body_length,
++					&password);
++				if (ret < 0) {
++					reason = MSG_NO_PASSWORD_ERROR;
++					oclog(ws, LOG_ERR,
++					      "failed reading password");
++					goto auth_fail;
++				}
+ 			}
+ 
+ 			areq.password = password;
+@@ -1897,6 +2264,17 @@ int post_auth_handler(worker_st *ws, unsigned int http_ver)
+ 			ws->sid_set = 0;
+ 			goto ask_auth;
+ 		} else {
++			if (sso_is_enabled() && ws->sso_attempted == 1) {
++				/* sso rejected by the backend: fall back to
++				 * the regular username/password form */
++				oclog(ws, LOG_ERR,
++				      "failed sso authentication for '%s'; falling back to password form",
++				      ws->username);
++				ws->sso_attempted = 2;
++				ws->auth_state = S_AUTH_INACTIVE;
++				ws->sid_set = 0;
++				goto ask_auth;
++			}
+ 			oclog(ws, LOG_ERR, "failed authentication for '%s'",
+ 			      ws->username);
+ 			goto auth_fail;
+diff --git a/src/worker-http-handlers.c b/src/worker-http-handlers.c
+index f825c02..4af4e88 100644
+--- a/src/worker-http-handlers.c
++++ b/src/worker-http-handlers.c
+@@ -30,6 +30,11 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <limits.h>
+@@ -167,3 +172,154 @@ int get_empty_handler(worker_st *ws, unsigned int http_ver)
+ }
+ 
+ #endif
++
++/* --- SSO proxy -----------------------------------------------------------
++ * Forwards GET requests under /+CSCOE+/sso/ to the local portal (plain
++ * HTTP on loopback).
++ * The portal's response (status line, headers including Set-Cookie, and
++ * body) is relayed verbatim to the client's embedded browser. Requests are
++ * reconstructed with a minimal header set: the portal flow keeps all state
++ * in the URL (sid, state, code), so no client headers or cookies need to
++ * be forwarded.
++ */
++#define SSO_PROXY_MAX_RESPONSE (64 * 1024)
++#define SSO_PROXY_TIMEOUT_SEC 5
++
++static int write_all(int fd, const void *buf, size_t len)
++{
++	const char *p = buf;
++	ssize_t n;
++
++	while (len > 0) {
++		n = write(fd, p, len);
++		if (n == 0)
++			return -1;
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++		p += n;
++		len -= n;
++	}
++	return 0;
++}
++
++static int sso_proxy_fail(worker_st *ws, unsigned int http_ver)
++{
++	oclog(ws, LOG_INFO, "sso proxy: upstream unavailable");
++	cstp_cork(ws);
++	cstp_printf(ws,
++		    "HTTP/1.%u 502 Bad Gateway\r\n"
++		    "Content-Length: 0\r\n"
++		    "Connection: close\r\n\r\n",
++		    http_ver);
++	cstp_uncork(ws);
++	return -1;
++}
++
++int get_sso_proxy_handler(worker_st *ws, unsigned int http_ver)
++{
++	struct addrinfo hints, *res = NULL, *rp;
++	struct timeval tv;
++	char host[64];
++	char portstr[8];
++	char req[512];
++	uint8_t *resp = NULL;
++	size_t got = 0;
++	unsigned int port;
++	ssize_t n;
++	int fd = -1;
++	int ret;
++	unsigned int reqlen;
++
++	oclog(ws, LOG_HTTP_DEBUG, "sso proxy: GET %s", ws->req.url);
++
++	if (!sso_is_enabled())
++		return response_404(ws, http_ver);
++
++	if (ws->req.url[0] == 0 || strchr(ws->req.url, ' ') != NULL)
++		return response_404(ws, http_ver);
++
++	sso_proxy_target(host, sizeof(host), &port);
++	snprintf(portstr, sizeof(portstr), "%u", port);
++
++	memset(&hints, 0, sizeof(hints));
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_STREAM;
++	if (getaddrinfo(host, portstr, &hints, &res) != 0 || res == NULL)
++		goto fail;
++
++	fd = -1;
++	for (rp = res; rp != NULL; rp = rp->ai_next) {
++		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
++		if (fd < 0)
++			continue;
++		tv.tv_sec = SSO_PROXY_TIMEOUT_SEC;
++		tv.tv_usec = 0;
++		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
++			break;
++		close(fd);
++		fd = -1;
++	}
++	freeaddrinfo(res);
++	res = NULL;
++	if (fd < 0)
++		goto fail;
++
++	reqlen = snprintf(req, sizeof(req),
++			  "GET %s HTTP/1.1\r\n"
++			  "Host: %s:%u\r\n"
++			  "User-Agent: ocserv-sso-proxy/1.0\r\n"
++			  "X-Real-IP: %s\r\n"
++			  "Connection: close\r\n"
++			  "\r\n",
++			  ws->req.url, host, port, ws->remote_ip_str);
++	if (reqlen <= 0 || reqlen >= sizeof(req))
++		goto fail;
++
++	if (write_all(fd, req, reqlen) < 0)
++		goto fail;
++
++	resp = talloc_size(ws, SSO_PROXY_MAX_RESPONSE);
++	if (resp == NULL)
++		goto fail;
++
++	while (got < SSO_PROXY_MAX_RESPONSE) {
++		n = read(fd, resp + got, SSO_PROXY_MAX_RESPONSE - got);
++		if (n == 0)
++			break;
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			goto fail;
++		}
++		got += (size_t)n;
++	}
++
++	close(fd);
++	fd = -1;
++
++	if (got == 0)
++		goto fail;
++
++	oclog(ws, LOG_HTTP_DEBUG, "sso proxy: relayed %zu bytes", got);
++	cstp_cork(ws);
++	ret = cstp_send(ws, resp, got);
++	if (cstp_uncork(ws) < 0 || ret < 0)
++		goto fail_nofd;
++
++	talloc_free(resp);
++	return 0;
++
++fail:
++	if (res != NULL)
++		freeaddrinfo(res);
++	if (fd != -1)
++		close(fd);
++	talloc_free(resp);
++fail_nofd:
++	return sso_proxy_fail(ws, http_ver);
++}
+diff --git a/src/worker-http.c b/src/worker-http.c
+index 54e0b15..2e54005 100644
+--- a/src/worker-http.c
++++ b/src/worker-http.c
+@@ -61,6 +61,8 @@ static const struct known_urls_st known_urls[] = {
+ 	LL("/", get_auth_handler, post_auth_handler),
+ 	LL("/auth", get_auth_handler, post_auth_handler),
+ 	LL("/VPN", get_auth_handler, post_auth_handler),
++	/* SSO browser-leg endpoints, proxied to the local portal */
++	LL_DIR("/+CSCOE+/sso", get_sso_proxy_handler, NULL),
+ #ifdef ANYCONNECT_CLIENT_COMPAT
+ 	LL_DIR("/profiles", get_config_handler, NULL),
+ 	LL("/VPNManifest.xml", get_string_handler, NULL),
+@@ -323,9 +325,26 @@ static void header_value_check(struct worker_st *ws, struct http_req_st *req)
+ 
+ 	/* make sure the value is null terminated */
+ 	value_length = req->value.length;
+-	memcpy(value, req->value.data, value_length);
++	memcpy(value, req->value.length ? req->value.data : (void *)"", value_length);
+ 	value[value_length] = 0;
+ 
++	/* SSO (STRAP): clients preferring the external-browser sso-v2 mode
++	 * send X-AnyConnect-STRAP-DH-Pubkey on the auth POST. Handled here
++	 * (not via the gperf table) to avoid regenerating http-heads.h. */
++	if (req->header.length ==
++		    sizeof("X-AnyConnect-STRAP-DH-Pubkey") - 1 &&
++	    strncasecmp((char *)req->header.data, "X-AnyConnect-STRAP-DH-Pubkey",
++			req->header.length) == 0) {
++		if (value_length > 0 &&
++		    value_length < sizeof(req->strap_dh_pubkey)) {
++			memcpy(req->strap_dh_pubkey, value, value_length);
++			req->strap_dh_pubkey[value_length] = 0;
++			req->strap_dh_pubkey_set = 1;
++			oclog(ws, LOG_DEBUG,
++			      "Detected STRAP DH pubkey (external-browser capable client)");
++		}
++	}
++
+ 	switch (req->next_header) {
+ 	case HEADER_MASTER_SECRET:
+ 		if (req->use_psk || !WSRCONFIG(ws)->dtls_legacy) /* ignored */
+@@ -349,6 +368,8 @@ static void header_value_check(struct worker_st *ws, struct http_req_st *req)
+ 			req->hostname[0] = 0;
+ 			goto cleanup;
+ 		}
++		memcpy(req->raw_hostname, value, value_length);
++		req->raw_hostname[value_length] = 0;
+ 		memcpy(req->hostname, value, value_length);
+ 		req->hostname[value_length] = 0;
+ 
+diff --git a/src/worker.h b/src/worker.h
+index 11c217a..ab8bac7 100644
+--- a/src/worker.h
++++ b/src/worker.h
+@@ -139,6 +139,7 @@ struct http_req_st {
+ 	char devtype[MAX_AGENT_NAME]; /* Device-Type */
+ 	char devplatform[MAX_AGENT_NAME]; /* Device-Platform */
+ 	char hostname[MAX_HOSTNAME_SIZE];
++	char raw_hostname[MAX_HOSTNAME_SIZE]; /* Host header before strip_domain */
+ 	char user_agent[MAX_AGENT_NAME];
+ 	unsigned int user_agent_type;
+ 
+@@ -174,6 +175,12 @@ struct http_req_st {
+ 
+ 	char *authorization;
+ 	unsigned int authorization_size;
++
++	/* X-AnyConnect-STRAP-DH-Pubkey (base64 SPKI) from clients that prefer
++	 * the external-browser (STRAP) sso-v2 mode; forwarded to the portal
++	 * via the sso-v2-login URL so it can ECIES-encrypt the token back. */
++	char strap_dh_pubkey[192];
++	unsigned int strap_dh_pubkey_set;
+ };
+ 
+ typedef struct dtls_transport_ptr {
+@@ -310,6 +317,13 @@ typedef struct worker_st {
+ 	char groupname[MAX_GROUPNAME_SIZE];
+ 	unsigned int groupname_url_forced;
+ 
++	/* SSO (sso-v2) state: client advertised single-sign-on-v2, an sso
++	 * form was sent (1) and later rejected (2), and the sid embedded in
++	 * the sso-v2-login URL (26 hex chars). */
++	unsigned int sso_capable;
++	unsigned int sso_attempted;
++	char sso_sid[27];
++
+ 	char cert_username[MAX_USERNAME_SIZE];
+ 	char **cert_groups;
+ 	unsigned int cert_groups_size;
+@@ -371,6 +385,9 @@ int post_svc_handler(worker_st *ws, unsigned int http_ver);
+ int response_404(worker_st *ws, unsigned int http_ver);
+ int response_401(worker_st *ws, unsigned int http_ver, char *realm);
+ int get_empty_handler(worker_st *server, unsigned int http_ver);
++int get_sso_proxy_handler(worker_st *ws, unsigned int http_ver);
++unsigned int sso_is_enabled(void);
++void sso_proxy_target(char *host, size_t host_size, unsigned int *port);
+ #ifdef ANYCONNECT_CLIENT_COMPAT
+ int get_config_handler(worker_st *ws, unsigned int http_ver);
+ #endif

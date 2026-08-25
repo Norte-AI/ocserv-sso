@@ -1,0 +1,50 @@
+# --- 监听 ---
+tcp-port = 443
+udp-port = 443
+
+# --- 证书 (Let's Encrypt, 宿主机签发后挂载进容器) ---
+# 客户端对证书域名不匹配是硬失败, server-cert/server-key 必须覆盖实际接入域名.
+server-cert = /etc/letsencrypt/live/vpn.example.com/fullchain.pem
+server-key  = /etc/letsencrypt/live/vpn.example.com/privkey.pem
+
+# --- 认证: PAM (pam_exec -> portal POST /introspect) ---
+# pam_exec helper 拿 password("sid.ticket" 或 device-flow access_token) 到
+# portal 校验, active=true 即放行. 认证决策收敛到 portal 一处.
+auth = "pam[service=ocserv]"
+
+# --- VPN 网段 (不与 LAN 重叠) ---
+ipv4-network = 10.99.0.0
+ipv4-netmask = 255.255.255.0
+device = vpns                # tun 设备名, host 防火墙规则按此名匹配
+
+# --- 分流路由 (按需添加; 注释掉即全流量模式之外的默认行为) ---
+# route = 10.0.0.0/255.0.0.0
+# route = 172.16.0.0/255.240.0.0
+
+# --- DNS push ---
+dns = 1.1.1.1
+dns = 9.9.9.9
+# tunnel-all-dns 默认 false (分流模式): 客户端解析走本地 DNS, 仅 VPN 网段流量进隧道.
+tunnel-all-dns = false
+
+# --- 安全 ---
+max-clients = 16
+max-same-clients = 2
+isolate-workers = true
+# auth-timeout 需覆盖 sso-v2 浏览器认证全程 (GitHub OAuth 授权).
+auth-timeout = 300
+run-as-user = ocserv
+run-as-group = ocserv
+use-occtl = true
+# ocserv 1.5.0: socket-file 强制必填 (use-occtl=true 时). 主进程以 root 创建
+# socket 后再降权, 故 /var/run 可写.
+socket-file = /var/run/occtl.socket
+
+# --- ban 系统 ---
+max-ban-score = 50              # 5 次错密码 = 50 分 → 封禁
+ban-time = 3600                 # 封 1 小时
+ban-reset-time = 300
+
+# --- 日志 ---
+log-level = 2
+syslog-facility = local0

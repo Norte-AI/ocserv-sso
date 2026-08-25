@@ -1,0 +1,117 @@
+"""vpn-cli — Device Flow 认证 + openconnect 连接器 (stdlib only).
+
+用法:
+  vpn-cli connect <host> [--portal-url URL] [--interval S]
+
+流程 (GitHub Device Flow, 无 PAT):
+  1. POST portal /device/code          -> user_code + verification_uri
+  2. 提示用户在任意浏览器打开 verification_uri 输入 user_code
+  3. 轮询 POST portal /device/token    -> access_token (GitHub)
+  4. exec sudo openconnect <host> --user=<login>, access_token 经 stdin 注入
+     (P1 后 ocserv auth=pam -> pam_exec -> portal /introspect 校验 token)
+
+设计约束:
+  - 单文件 stdlib (无 requests/pip 依赖): curl | bin 即用.
+  - access_token 不入 argv (argv 对本机所有进程可见), 只走 stdin.
+  - portal URL 默认 https://<host> (公网); 客户端经浏览器腿可达的公网入口访问
+    /device/* 端点 (P2 单容器后同端口 443 亦可).
+"""
+import argparse
+import json
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+DEFAULT_PORTAL = "https://{host}"
+POLL_MARGIN = 1  # 秒, interval 之上的轮询余量
+
+
+def _post(url: str, data: dict, timeout: int = 15) -> dict:
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def device_flow(portal: str) -> tuple[str, str]:
+    """返回 (access_token, login). 失败抛 SystemExit."""
+    try:
+        d = _post(f"{portal}/device/code", {})
+    except Exception as e:
+        raise SystemExit(f"device/code 请求失败: {e}")
+    user_code = d.get("user_code")
+    if not user_code:
+        raise SystemExit(f"device/code 响应异常: {d}")
+
+    print(f"请打开 {d['verification_uri']} 并输入验证码: {user_code}", file=sys.stderr)
+    print("(GitHub 会话有效期内静默, 无需每次授权)", file=sys.stderr)
+
+    interval = int(d.get("interval", 5)) + POLL_MARGIN
+    deadline = time.monotonic() + int(d.get("expires_in", 900))
+    payload = {"device_code": d["device_code"]}
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        try:
+            t = _post(f"{portal}/device/token", payload)
+        except Exception as e:
+            print(f"轮询失败, 重试: {e}", file=sys.stderr)
+            continue
+        if "access_token" in t:
+            login = t.get("login") or _github_login(t["access_token"])
+            return t["access_token"], login
+        err = t.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err == "expired_token":
+            raise SystemExit("验证码已过期, 请重新运行 vpn-cli")
+        raise SystemExit(f"授权失败: {err or t}")
+    raise SystemExit("授权超时")
+
+
+def _github_login(access_token: str) -> str:
+    req = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {access_token}",
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())["login"]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="vpn-cli",
+                                 description="GitHub Device Flow VPN connector")
+    ap.add_argument("command", choices=["connect"])
+    ap.add_argument("host", help="VPN 网关域名 (如 vpn.example.com)")
+    ap.add_argument("--portal-url", default=None,
+                    help="portal 公网入口 (默认 https://<host>)")
+    ap.add_argument("--user", default=None,
+                    help="覆盖 GitHub login (默认取 device token 关联用户)")
+    ap.add_argument("--openconnect", default="openconnect",
+                    help="openconnect 可执行路径")
+    args = ap.parse_args()
+
+    portal = (args.portal_url or DEFAULT_PORTAL.format(host=args.host)).rstrip("/")
+    token, login = device_flow(portal)
+    user = args.user or login
+    print(f"已授权 GitHub 用户: {user}; 正在建立 VPN 隧道...", file=sys.stderr)
+
+    # access_token 只经 stdin 注入 (openconnect --passwd-on-stdin), 不进 argv.
+    cmd = ["sudo", args.openconnect, f"--user={user}",
+           "--passwd-on-stdin", args.host]
+    try:
+        proc = subprocess.run(cmd, input=(token + "\n").encode(), check=False)
+        return proc.returncode
+    except FileNotFoundError:
+        raise SystemExit(f"找不到 {args.openconnect}; 请先安装 openconnect")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

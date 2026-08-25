@@ -1,0 +1,6 @@
+fastapi>=0.110
+# Starlette 表单解析依赖 (pam_exec helper 以 application/x-www-form-urlencoded POST /introspect)
+python-multipart>=0.0.9
+uvicorn>=0.29
+requests>=2.31
+cryptography>=42

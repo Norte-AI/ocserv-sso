@@ -1,0 +1,12 @@
+# ocserv VPN authentication (auth = "pam[service=ocserv]").
+#
+# auth: pam_exec runs ocserv_portal_auth.py. expose_authtok hands the
+# password (from ocserv's ocserv_conv, i.e. the sso patch's "sid.ticket"
+# split) to the helper on stdin; PAM_USER carries the username.
+# account: no system-account management — org membership is decided by the
+# portal at ticket issuance, and pam_exec's exit code is the verdict.
+# NOTE: no pam_env/pam_permit/silent lines — libpam on Debian 12 treats
+# unresolvable module references as hard failures.
+
+auth     required  pam_exec.so expose_authtok /usr/local/libexec/ocserv_portal_auth.py
+account  required  pam_permit.so
