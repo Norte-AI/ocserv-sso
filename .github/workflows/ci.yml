@@ -31,7 +31,7 @@ jobs:
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz -C /tmp
           sudo mv /tmp/gitleaks /usr/local/bin/
       - name: Scan for secrets
-        run: gitleaks detect --source . --no-banner --redact --fail-on=any
+        run: gitleaks detect --source . --no-banner --redact
 
   build:
     name: single image build
