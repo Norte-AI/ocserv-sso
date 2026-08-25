@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Single-container build: ocserv (compiled) + vpn-portal (uvicorn) + pam_exec
 # helper, one debian:12-slim runtime. Replaces the two-container
 # ocserv+portal pair (P2 of docs/refactor-single-container-spec.md).
