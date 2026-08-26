@@ -13,6 +13,16 @@ set -eu
 SSO_BIND="${SSO_BIND:-127.0.0.1}"
 SSO_PORT="${SSO_PORT:-8443}"
 
+# Optional forward HTTPS proxy (e.g. gost on a host outside a region that
+# blocks github.com). Mounted as a read-only secret file so the proxy URL
+# (which contains credentials) never lands in docker inspect Config.Env.
+# requests/urllib3 honor HTTPS_PROXY for the portal's server-side calls to
+# github.com (Device Flow + token exchange); api.github.com stays direct
+# via NO_PROXY.
+if [ -f /run/secrets/https_proxy ]; then
+    export HTTPS_PROXY="$(cat /run/secrets/https_proxy)"
+fi
+
 cd /opt/vpn-portal
 uvicorn app:app --host "$SSO_BIND" --port "$SSO_PORT" --no-access-log &
 PORTAL_PID=$!
