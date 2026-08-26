@@ -1,0 +1,38 @@
+# Cloudflare Worker — reverse proxy for the two GitHub OAuth endpoints that
+# the ocserv-sso portal reaches *server-side*: /login/device/code (Device Flow)
+# and /login/oauth/access_token (token exchange). The host running the portal
+# (e.g. vpn_01 in a region that blocks github.com) points the portal's
+# GITHUB_TOKEN_URL / GITHUB_DEVICE_CODE_URL env vars at this Worker instead of
+# github.com directly.
+#
+# Only these two POST paths are proxied; everything else returns 404 so the
+# Worker cannot be abused as an open GitHub mirror. api.github.com (used for
+# the /user lookup) is NOT proxied — it remains reachable from the host.
+# The browser authorize leg (github.com/login/oauth/authorize) is hit by the
+# user's own browser, which is outside the blocked region, so it is NOT proxied
+# here either.
+#
+# Deploy:
+#   1. wrangler login (or set CLOUDFLARE_API_TOKEN)
+#   2. wrangler deploy
+#   3. Note the Worker URL (https://<name>.<account>.workers.dev)
+#   4. On the portal host set:
+#        GITHUB_TOKEN_URL=https://<name>.<account>.workers.dev/login/oauth/access_token
+#        GITHUB_DEVICE_CODE_URL=https://<name>.<account>.workers.dev/login/device/code
+#
+# Cost: Cloudflare Workers free tier = 100,000 requests/day. SSO login volume
+# is far below that, so this is free.
+#
+# Security: the Worker is your own (on your Cloudflare account). OAuth tokens
+# transit it, but only you control it — unlike a public GitHub proxy, this is
+# acceptable. For extra hardening restrict the Worker to your portal host's IP
+# via a `GITHUB_PROXY_ALLOW_IP` var (commented below).
+
+name = "ocserv-sso-github-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# [vars]
+# Comma-separated CIDR/IP allowlist; empty = allow any. Set to your portal
+# host's public IP to prevent third-party abuse of the Worker.
+# GITHUB_PROXY_ALLOW_IP = ""

@@ -74,8 +74,17 @@ FAKE_GITHUB = os.environ.get("SSO_FAKE_GITHUB") == "1"
 FAKE_LOGIN = os.environ.get("SSO_FAKE_LOGIN", "testuser")
 FAKE_MEMBER = os.environ.get("SSO_FAKE_MEMBER", "1") == "1"
 
+# Browser leg: the user's browser hits github.com directly (the user is
+# outside the blocked region or has their own proxy), so this stays fixed.
 GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
-GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+# Server-side calls (token exchange, device/code). Override these to point at
+# a reverse proxy (e.g. a Cloudflare Worker) when the host cannot reach
+# github.com directly. Defaults are the real github.com endpoints.
+GITHUB_TOKEN_URL = os.environ.get(
+    "GITHUB_TOKEN_URL", "https://github.com/login/oauth/access_token"
+)
+# api.github.com is reachable from the host even when github.com is blocked,
+# so no proxy is needed for the /user lookup.
 GITHUB_USER_URL = "https://api.github.com/user"
 
 SID_RE = re.compile(r"^[0-9a-f]{26}$")
@@ -481,7 +490,11 @@ async def introspect(request: Request):
 
 # --- Device Flow (vpn-cli; 代理 GitHub, 不暂存 access_token) -----------------
 
-DEVICE_CODE_URL = "https://github.com/login/device/code"
+# Server-side Device Flow call; override with GITHUB_DEVICE_CODE_URL to point
+# at a reverse proxy (e.g. a Cloudflare Worker) when github.com is unreachable.
+DEVICE_CODE_URL = os.environ.get(
+    "GITHUB_DEVICE_CODE_URL", "https://github.com/login/device/code"
+)
 DEVICE_SCOPE = "read:org read:user"
 
 
