@@ -82,6 +82,17 @@ tests/            test_portal.py (unit), sso_protocol_sim.py + run_integration.s
 | `OCSERV_SSO_BASE_URL` | `https://localhost` | ocserv-side base URL (browser-leg proxy target) |
 | `SSO_VERIFY_ALLOWED_HOSTS` | `127.0.0.1,::1` | IPs allowed to call `/verify` (loopback) |
 | `SSO_SECRETS_DIR` | `/run/secrets` | Where the portal reads secret files |
+| `SSO_GITHUB_PROXY_MONITOR` | `1` | Log GitHub server-side connectivity every interval |
+| `SSO_GITHUB_PROXY_MONITOR_INTERVAL` | `300` | Connectivity check interval in seconds (minimum `60`) |
+| `SSO_GITHUB_PROXY_MONITOR_URL` | `GITHUB_TOKEN_URL` | URL used by the connectivity check |
+
+The monitor logs `github_proxy_monitor` records with whether `HTTPS_PROXY` is
+configured, the HTTP status or transport error, and latency. It never logs the
+proxy URL or credentials. Example:
+
+```console
+INFO:vpn-portal:github_proxy_monitor: configured=True status=302 latency_ms=1875
+```
 
 Secrets are **files**, not env. The compose example mounts the four files above as read-only volumes.
 

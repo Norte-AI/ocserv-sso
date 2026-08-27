@@ -83,6 +83,7 @@ docker run -d --name ocserv-sso --network "$NET" \
   -e SSO_BIND=127.0.0.1 -e SSO_PORT=8443 \
   -e SSO_FAKE_GITHUB=1 -e SSO_FAKE_LOGIN=octocat -e SSO_FAKE_MEMBER=1 \
   -e SSO_VERIFY_ALLOWED_HOSTS="*" \
+  -e SSO_GITHUB_PROXY_MONITOR=0 \
   -e SSO_SECRETS_DIR=/run/secrets \
   -e OCSERV_SSO_ENABLE=1 \
   -e OCSERV_SSO_BASE_URL="${BASE}" \

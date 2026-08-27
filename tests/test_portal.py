@@ -31,6 +31,7 @@ os.environ.update(
     SSO_FAKE_LOGIN="octo-cat",
     SSO_FAKE_MEMBER="1",
     SSO_VERIFY_ALLOWED_HOSTS="127.0.0.1,::1,testclient",
+    SSO_GITHUB_PROXY_MONITOR="0",
 )
 
 _spec = importlib.util.spec_from_file_location("vpn_portal_app", PORTAL_DIR / "app.py")
@@ -393,6 +394,35 @@ def test_done_page(client):
     r = client.get(f"{portal.PREFIX}/done")
     assert r.status_code == 200
     assert "acSamlv2Token" in r.text
+
+
+def test_github_proxy_monitor_success(monkeypatch):
+    class Response:
+        status_code = 404
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example")
+    monkeypatch.setenv("SSO_GITHUB_PROXY_MONITOR_URL", "https://github-proxy.test")
+    monkeypatch.setattr(
+        portal.requests, "get", lambda *args, **kwargs: Response()
+    )
+    result = portal._github_proxy_monitor_once()
+    assert result["configured"] is True
+    assert result["status"] == 404
+    assert "latency_ms" in result
+
+
+def test_github_proxy_monitor_failure(monkeypatch):
+    def get(*args, **kwargs):
+        raise portal.requests.ConnectionError("unreachable")
+
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setattr(portal.requests, "get", get)
+    result = portal._github_proxy_monitor_once()
+    assert result == {
+        "configured": False,
+        "error": "ConnectionError",
+        "latency_ms": result["latency_ms"],
+    }
 
 
 def test_healthz(client):

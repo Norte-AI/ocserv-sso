@@ -63,6 +63,10 @@ PENDING_TTL = int(os.environ.get("PENDING_TTL", "300"))
 PENDING_MAX = int(os.environ.get("PENDING_MAX", "1024"))
 MEMBER_CACHE_TTL = 300
 API_TIMEOUT = 5
+GITHUB_PROXY_MONITOR_INTERVAL = max(
+    60, int(os.environ.get("SSO_GITHUB_PROXY_MONITOR_INTERVAL", "300"))
+)
+GITHUB_PROXY_MONITOR_ENABLED = os.environ.get("SSO_GITHUB_PROXY_MONITOR", "1") != "0"
 VERIFY_ALLOWED_HOSTS = set(
     os.environ.get("SSO_VERIFY_ALLOWED_HOSTS", "127.0.0.1,::1").split(",")
 )
@@ -102,6 +106,49 @@ INTROSPECT_TOKEN_RE = re.compile(r"^([0-9a-f]{26})\.([0-9a-z]{32})$")
 # Device Flow 轮询暂存: device_code -> {"t": float, "interval": int}
 DEVICE_PENDING = {}
 DEVICE_PENDING_TTL = 900
+
+
+def _github_proxy_monitor_once() -> dict:
+    started = time.monotonic()
+    configured = bool(os.environ.get("HTTPS_PROXY"))
+    try:
+        response = requests.get(
+            os.environ.get("SSO_GITHUB_PROXY_MONITOR_URL", GITHUB_TOKEN_URL),
+            timeout=API_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.RequestException as error:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        result = {
+            "configured": configured,
+            "error": type(error).__name__,
+            "latency_ms": latency_ms,
+        }
+        log.warning(
+            "github_proxy_monitor: configured=%(configured)s "
+            "error=%(error)s latency_ms=%(latency_ms)s",
+            result,
+        )
+        return result
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    result = {
+        "configured": configured,
+        "status": response.status_code,
+        "latency_ms": latency_ms,
+    }
+    log.info(
+        "github_proxy_monitor: configured=%(configured)s "
+        "status=%(status)s latency_ms=%(latency_ms)s",
+        result,
+    )
+    return result
+
+
+def _github_proxy_monitor_loop() -> None:
+    while True:
+        _github_proxy_monitor_once()
+        time.sleep(GITHUB_PROXY_MONITOR_INTERVAL)
 
 
 def _read_secret(name: str) -> str:
@@ -287,6 +334,18 @@ def _success_redirect(sid: str, login: str, dh: str = "") -> RedirectResponse:
 
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.on_event("startup")
+def start_github_proxy_monitor() -> None:
+    if not GITHUB_PROXY_MONITOR_ENABLED:
+        return
+    thread = threading.Thread(
+        target=_github_proxy_monitor_loop,
+        name="github-proxy-monitor",
+        daemon=True,
+    )
+    thread.start()
 
 
 # --- browser-leg endpoints (served through the ocserv /+CSCOE+/sso proxy) ----
